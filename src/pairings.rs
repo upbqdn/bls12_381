@@ -782,11 +782,44 @@ impl Group for Gt {
 /// multiple pairings or is otherwise known in advance. This should be used in
 /// conjunction with the [`multi_miller_loop`](crate::multi_miller_loop)
 /// function provided by this crate.
+/// For public points reused across Miller loops, use
+/// [`MultiMillerLoop::prepare_reusable_g2`] to normalize cached lines once.
+/// Raw Miller results can differ; final pairing results remain unchanged.
 ///
 /// Requires the `alloc` and `pairing` crate features to be enabled.
 pub struct G2Prepared {
     infinity: Choice,
+    normalized: bool,
     coeffs: Vec<(Fp2, Fp2, Fp2)>,
+}
+
+#[cfg(feature = "alloc")]
+impl G2Prepared {
+    fn normalize_lines(&mut self) {
+        // Every line may be scaled by a nonzero Fp2 element: the factor
+        // disappears in the final exponentiation. Make the unscaled line
+        // coefficient one so Miller multiplication needs two coefficients.
+        // Batch inversion pays for just one field inversion across all lines.
+        let mut prefixes = Vec::with_capacity(self.coeffs.len());
+        let mut product = Fp2::one();
+        for (_, _, c0) in &self.coeffs {
+            prefixes.push(product);
+            let value = Fp2::conditional_select(c0, &Fp2::one(), c0.is_zero());
+            product *= value;
+        }
+        let mut inverse = product.invert().unwrap();
+        for ((c4, c1, c0), prefix) in self.coeffs.iter_mut().zip(prefixes).rev() {
+            let value = Fp2::conditional_select(c0, &Fp2::one(), c0.is_zero());
+            let factor = inverse * prefix;
+            inverse *= value;
+            if !bool::from(c0.is_zero()) {
+                *c4 *= factor;
+                *c1 *= factor;
+                *c0 = Fp2::one();
+            }
+        }
+        self.normalized = true;
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -829,6 +862,7 @@ impl From<G2Affine> for G2Prepared {
 
         G2Prepared {
             infinity: is_identity,
+            normalized: false,
             coeffs: adder.coeffs,
         }
     }
@@ -854,7 +888,11 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
             for term in self.terms {
                 let either_identity = term.0.is_identity() | term.1.infinity;
 
-                let new_f = ell(f, &term.1.coeffs[index], term.0);
+                let new_f = if term.1.normalized {
+                    ell_prepared(f, &term.1.coeffs[index], term.0)
+                } else {
+                    ell(f, &term.1.coeffs[index], term.0)
+                };
                 f = Fp12::conditional_select(&new_f, &f, either_identity);
             }
             self.index += 1;
@@ -866,7 +904,11 @@ pub fn multi_miller_loop(terms: &[(&G1Affine, &G2Prepared)]) -> MillerLoopResult
             for term in self.terms {
                 let either_identity = term.0.is_identity() | term.1.infinity;
 
-                let new_f = ell(f, &term.1.coeffs[index], term.0);
+                let new_f = if term.1.normalized {
+                    ell_prepared(f, &term.1.coeffs[index], term.0)
+                } else {
+                    ell(f, &term.1.coeffs[index], term.0)
+                };
                 f = Fp12::conditional_select(&new_f, &f, either_identity);
             }
             self.index += 1;
@@ -982,7 +1024,8 @@ fn miller_loop<D: MillerLoopDriver>(driver: &mut D) -> D::Output {
     f
 }
 
-fn ell(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> Fp12 {
+#[inline]
+fn evaluated_line(coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> (Fp2, Fp2) {
     let mut c0 = coeffs.0;
     let mut c1 = coeffs.1;
 
@@ -992,7 +1035,50 @@ fn ell(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> Fp12 {
     c1.c0 *= p.x;
     c1.c1 *= p.x;
 
-    f.mul_by_014(&coeffs.2, &c1, &c0)
+    (c1, c0)
+}
+
+fn ell(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> Fp12 {
+    let (c1, c4) = evaluated_line(coeffs, p);
+    f.mul_by_014(&coeffs.2, &c1, &c4)
+}
+
+#[cfg(feature = "alloc")]
+fn ell_prepared(f: Fp12, coeffs: &(Fp2, Fp2, Fp2), p: &G1Affine) -> Fp12 {
+    let (c1, c4) = evaluated_line(coeffs, p);
+    if bool::from(coeffs.2.ct_eq(&Fp2::one())) {
+        mul_by_014_unit(&f, &c1, &c4)
+    } else {
+        f.mul_by_014(&coeffs.2, &c1, &c4)
+    }
+}
+
+#[cfg(feature = "alloc")]
+fn mul_by_014_unit(f: &Fp12, c1: &Fp2, c4: &Fp2) -> Fp12 {
+    #[inline]
+    fn sum_of_two_fp2_products(a: &Fp2, b: &Fp2, c: &Fp2, d: &Fp2) -> Fp2 {
+        Fp2 {
+            c0: Fp::sum_of_products([a.c0, -a.c1, c.c0, -c.c1], [b.c0, b.c1, d.c0, d.c1]),
+            c1: Fp::sum_of_products([a.c0, a.c1, c.c0, c.c1], [b.c1, b.c0, d.c1, d.c0]),
+        }
+    }
+
+    let xc1 = c1.mul_by_nonresidue();
+    let xc4 = c4.mul_by_nonresidue();
+    let a = &f.c0;
+    let b = &f.c1;
+    Fp12 {
+        c0: Fp6 {
+            c0: a.c0 + sum_of_two_fp2_products(&a.c2, &xc1, &b.c1, &xc4),
+            c1: a.c1 + sum_of_two_fp2_products(&a.c0, c1, &b.c2, &xc4),
+            c2: a.c2 + sum_of_two_fp2_products(&a.c1, c1, &b.c0, c4),
+        },
+        c1: Fp6 {
+            c0: b.c0 + sum_of_two_fp2_products(&a.c2, &xc4, &b.c2, &xc1),
+            c1: b.c1 + sum_of_two_fp2_products(&a.c0, c4, &b.c0, c1),
+            c2: b.c2 + sum_of_two_fp2_products(&a.c1, c4, &b.c1, c1),
+        },
+    }
 }
 
 fn doubling_step(r: &mut G2Projective) -> (Fp2, Fp2, Fp2) {
@@ -1110,6 +1196,12 @@ impl pairing::MillerLoopResult for MillerLoopResult {
 impl MultiMillerLoop for Bls12 {
     type G2Prepared = G2Prepared;
     type Result = MillerLoopResult;
+
+    fn prepare_reusable_g2(q: Self::G2Affine) -> Self::G2Prepared {
+        let mut prepared = G2Prepared::from(q);
+        prepared.normalize_lines();
+        prepared
+    }
 
     fn multi_miller_loop(terms: &[(&Self::G1Affine, &Self::G2Prepared)]) -> Self::Result {
         multi_miller_loop(terms)
@@ -1260,6 +1352,61 @@ fn tricking_miller_loop_result() {
         .final_exponentiation(),
         Gt::identity()
     );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn test_reusable_g2_preparation() {
+    let p = G1Affine::generator();
+    let q = G2Affine::from(G2Projective::generator() * Scalar::from(17));
+    let raw = G2Prepared::from(q);
+    let normalized = Bls12::prepare_reusable_g2(q);
+
+    assert!(normalized
+        .coeffs
+        .iter()
+        .all(|(_, _, c0)| bool::from(c0.is_zero()) || *c0 == Fp2::one()));
+    assert_eq!(
+        multi_miller_loop(&[(&p, &raw)]).final_exponentiation(),
+        multi_miller_loop(&[(&p, &normalized)]).final_exponentiation(),
+    );
+    assert_eq!(
+        multi_miller_loop(&[(&p, &raw), (&p, &normalized)]).final_exponentiation(),
+        pairing(&p, &q) + pairing(&p, &q),
+    );
+
+    let mut raw_with_zero = raw.clone();
+    raw_with_zero.coeffs[17].2 = Fp2::zero();
+    let mut normalized_with_zero = raw_with_zero.clone();
+    normalized_with_zero.normalize_lines();
+    assert_eq!(normalized_with_zero.coeffs[17], raw_with_zero.coeffs[17]);
+    assert_eq!(
+        multi_miller_loop(&[(&p, &raw_with_zero)]).final_exponentiation(),
+        multi_miller_loop(&[(&p, &normalized_with_zero)]).final_exponentiation(),
+    );
+
+    let infinity = Bls12::prepare_reusable_g2(G2Affine::identity());
+    assert_eq!(
+        multi_miller_loop(&[(&p, &infinity)]).final_exponentiation(),
+        Gt::identity(),
+    );
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn test_mul_by_014_unit_matches_sparse_product() {
+    use rand_core::SeedableRng;
+
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x5a; 16]);
+    for _ in 0..32 {
+        let f = Fp12::try_random(&mut rng).unwrap();
+        let c1 = Fp2::try_random(&mut rng).unwrap();
+        let c4 = Fp2::try_random(&mut rng).unwrap();
+        assert_eq!(
+            mul_by_014_unit(&f, &c1, &c4),
+            f.mul_by_014(&Fp2::one(), &c1, &c4)
+        );
+    }
 }
 
 #[test]
@@ -1477,3 +1624,97 @@ fn test_random_compressed_checkpoints_and_exception_fallback() {
     }
 }
 
+#[cfg(feature = "alloc")]
+#[test]
+fn test_random_reusable_preparation_and_mixed_miller_loops() {
+    use ff::Field;
+    use rand_core::SeedableRng;
+
+    assert_eq!(
+        multi_miller_loop(&[]).final_exponentiation_vartime(),
+        Gt::identity()
+    );
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x68; 16]);
+    for index in 0..32 {
+        let p = match index {
+            0 => G1Affine::identity(),
+            1 => -G1Affine::generator(),
+            _ => G1Affine::from(G1Projective::generator() * Scalar::try_random(&mut rng).unwrap()),
+        };
+        let q = match index {
+            0 | 2 => G2Affine::identity(),
+            1 => -G2Affine::generator(),
+            _ => G2Affine::from(G2Projective::generator() * Scalar::try_random(&mut rng).unwrap()),
+        };
+        let raw = G2Prepared::from(q);
+        let normalized = Bls12::prepare_reusable_g2(q);
+        let expected = pairing(&p, &q);
+        assert_eq!(
+            multi_miller_loop(&[(&p, &raw)]).final_exponentiation(),
+            expected
+        );
+        let reusable_result = multi_miller_loop(&[(&p, &normalized)]);
+        assert_eq!(reusable_result.final_exponentiation(), expected);
+        assert_eq!(reusable_result.final_exponentiation_vartime(), expected);
+        assert_eq!(
+            multi_miller_loop(&[(&p, &raw), (&p, &normalized)]).final_exponentiation_vartime(),
+            expected + expected,
+        );
+        assert_eq!(
+            multi_miller_loop(&[(&p, &raw), (&-p, &normalized)]).final_exponentiation_vartime(),
+            Gt::identity(),
+        );
+    }
+
+    let p = G1Affine::generator();
+    let raw = G2Prepared::from(G2Affine::generator());
+    // Exercise zero-line-coefficient fallback at both ends and in the middle.
+    for index in [0, 17, 67] {
+        let mut with_zero = raw.clone();
+        with_zero.coeffs[index].2 = Fp2::zero();
+        let mut normalized = with_zero.clone();
+        normalized.normalize_lines();
+        assert_eq!(normalized.coeffs[index], with_zero.coeffs[index]);
+        assert_eq!(
+            multi_miller_loop(&[(&p, &with_zero)]).final_exponentiation(),
+            multi_miller_loop(&[(&p, &normalized)]).final_exponentiation_vartime(),
+        );
+    }
+}
+
+#[cfg(feature = "alloc")]
+#[test]
+fn test_unit_sparse_product_boundaries() {
+    let high = Fp::from_raw_unchecked([
+        0xb9fe_ffff_ffff_aaaa,
+        0x1eab_fffe_b153_ffff,
+        0x6730_d2a0_f6b0_f624,
+        0x6477_4b84_f385_12bf,
+        0x4b1b_a7b6_434b_acd7,
+        0x1a01_11ea_397f_e69a,
+    ]);
+    let high = Fp2 { c0: high, c1: high };
+    let dense_high = Fp6 {
+        c0: high,
+        c1: high,
+        c2: high,
+    };
+    for f in [
+        Fp12::zero(),
+        Fp12::one(),
+        -Fp12::one(),
+        Fp12 {
+            c0: dense_high,
+            c1: dense_high,
+        },
+    ] {
+        for c1 in [Fp2::zero(), Fp2::one(), -Fp2::one(), high] {
+            for c4 in [Fp2::zero(), Fp2::one(), -Fp2::one(), high] {
+                assert_eq!(
+                    mul_by_014_unit(&f, &c1, &c4),
+                    f.mul_by_014(&Fp2::one(), &c1, &c4),
+                );
+            }
+        }
+    }
+}
