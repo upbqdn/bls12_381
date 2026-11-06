@@ -72,6 +72,9 @@ fn test_frobenius_map_2_matches_two_maps() {
 }
 
 #[test]
+// The compressed squaring schedule assumes a negative BLS parameter; MSRV Clippy flags any
+// assertion on that constant.
+#[allow(clippy::assertions_on_constants)]
 fn test_compressed_cyclotomic_squaring() {
     use rand_core::SeedableRng;
 
@@ -83,7 +86,7 @@ fn test_compressed_cyclotomic_squaring() {
         exponent |= 1_u64 << bit;
     }
     assert_eq!(BLS_X, exponent << 1);
-    const _: () = assert!(BLS_X_IS_NEGATIVE);
+    assert!(BLS_X_IS_NEGATIVE);
 
     let generator = Gt::generator().0;
     let mut rng = rand_xorshift::XorShiftRng::from_seed([0x35; 16]);
