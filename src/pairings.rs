@@ -1,8 +1,9 @@
 use crate::fp::Fp;
+use crate::fp12::Fp12;
 use crate::fp2::Fp2;
 use crate::fp6::Fp6;
-use crate::fp12::Fp12;
-use crate::{BLS_X, BLS_X_IS_NEGATIVE, G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
+use crate::g1::BETA;
+use crate::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar, BLS_X, BLS_X_IS_NEGATIVE};
 
 use core::borrow::Borrow;
 use core::fmt;
@@ -12,6 +13,10 @@ use group::Group;
 use pairing::{Engine, PairingCurveAffine};
 use rand_core::TryRng;
 use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
+
+const COMPRESSED_FIRST_SQUARES: usize = 15;
+const COMPRESSED_NEXT_SQUARES: usize = 32;
+const CYCLOTOMIC_TAIL_SQUARES: [usize; 4] = [9, 3, 2, 1];
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -38,6 +43,242 @@ impl ConditionallySelectable for MillerLoopResult {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         MillerLoopResult(Fp12::conditional_select(&a.0, &b.0, choice))
     }
+}
+
+#[must_use]
+fn fp4_square(a: Fp2, b: Fp2) -> (Fp2, Fp2) {
+    let t0 = a.square();
+    let t1 = b.square();
+    let mut t2 = t1.mul_by_nonresidue();
+    let c0 = t2 + t0;
+    t2 = a + b;
+    t2 = t2.square();
+    t2 -= t0;
+    let c1 = t2 - t1;
+
+    (c0, c1)
+}
+
+#[inline(always)]
+fn mul_fp2_by_fp(value: Fp2, factor: Fp) -> Fp2 {
+    Fp2 {
+        c0: value.c0 * factor,
+        c1: value.c1 * factor,
+    }
+}
+
+#[inline]
+fn frobenius_map_2(value: Fp12) -> Fp12 {
+    // BETA = (u + 1)^((p^2 - 1) / 3), which lies in Fp.
+    let gamma = BETA;
+    // gamma^2 + gamma + 1 = 0, and the w coefficient is -gamma^2.
+    let delta = gamma + Fp::one();
+    Fp12 {
+        c0: Fp6 {
+            c0: value.c0.c0,
+            c1: mul_fp2_by_fp(value.c0.c1, gamma),
+            c2: mul_fp2_by_fp(value.c0.c2, -delta),
+        },
+        c1: Fp6 {
+            c0: mul_fp2_by_fp(value.c1.c0, delta),
+            c1: -value.c1.c1,
+            c2: mul_fp2_by_fp(value.c1.c2, -gamma),
+        },
+    }
+}
+// Adaptation of Algorithm 5.5.4, Guide to Pairing-Based Cryptography
+// Faster Squaring in the Cyclotomic Subgroup of Sixth Degree Extensions
+// https://eprint.iacr.org/2009/565.pdf
+#[must_use]
+fn cyclotomic_square(f: Fp12) -> Fp12 {
+    let mut z0 = f.c0.c0;
+    let mut z4 = f.c0.c1;
+    let mut z3 = f.c0.c2;
+    let mut z2 = f.c1.c0;
+    let mut z1 = f.c1.c1;
+    let mut z5 = f.c1.c2;
+
+    let (t0, t1) = fp4_square(z0, z1);
+
+    // For A
+    z0 = t0 - z0;
+    z0 = z0 + z0 + t0;
+
+    z1 = t1 + z1;
+    z1 = z1 + z1 + t1;
+
+    let (mut t0, t1) = fp4_square(z2, z3);
+    let (t2, t3) = fp4_square(z4, z5);
+
+    // For C
+    z4 = t0 - z4;
+    z4 = z4 + z4 + t0;
+
+    z5 = t1 + z5;
+    z5 = z5 + z5 + t1;
+
+    // For B
+    t0 = t3.mul_by_nonresidue();
+    z2 = t0 + z2;
+    z2 = z2 + z2 + t0;
+
+    z3 = t2 - z3;
+    z3 = z3 + z3 + t2;
+
+    Fp12 {
+        c0: Fp6 {
+            c0: z0,
+            c1: z4,
+            c2: z3,
+        },
+        c1: Fp6 {
+            c0: z2,
+            c1: z1,
+            c2: z5,
+        },
+    }
+}
+// Karabina compressed squaring retains these four coefficients. The omitted
+// coefficients must be reconstructed before ordinary Fp12 arithmetic.
+// Adapted from gnark-crypto's BLS12-381 fptower E12 implementation.
+#[derive(Copy, Clone)]
+struct CompressedCyclotomic {
+    g1: Fp2,
+    g2: Fp2,
+    g3: Fp2,
+    g5: Fp2,
+}
+
+impl From<Fp12> for CompressedCyclotomic {
+    fn from(value: Fp12) -> Self {
+        Self {
+            g1: value.c0.c1,
+            g2: value.c0.c2,
+            g3: value.c1.c0,
+            g5: value.c1.c2,
+        }
+    }
+}
+
+#[must_use]
+fn compressed_square(f: CompressedCyclotomic) -> CompressedCyclotomic {
+    let CompressedCyclotomic { g1, g2, g3, g5 } = f;
+
+    let g1_sq = g1.square();
+    let g5_sq = g5.square();
+    let twice_g1_g5 = (g1 + g5).square() - g1_sq - g5_sq;
+    let g3_sq = g3.square();
+    let g2_sq = g2.square();
+    let twice_g3_g2 = (g3 + g2).square() - g3_sq - g2_sq;
+
+    let a = g1_sq + g5_sq.mul_by_nonresidue();
+    let b = g3_sq + g2_sq.mul_by_nonresidue();
+    let c = twice_g1_g5.mul_by_nonresidue();
+
+    CompressedCyclotomic {
+        g1: b + b + b - g1 - g1,
+        g2: a + a + a - g2 - g2,
+        g3: c + c + c + g3 + g3,
+        g5: twice_g3_g2 + twice_g3_g2 + twice_g3_g2 + g5 + g5,
+    }
+}
+
+fn invert_fp6_vartime(value: Fp6) -> Option<Fp6> {
+    let c0 = value.c0.square() - (value.c1 * value.c2).mul_by_nonresidue();
+    let c1 = value.c2.square().mul_by_nonresidue() - value.c0 * value.c1;
+    let c2 = value.c1.square() - value.c0 * value.c2;
+    let determinant = (value.c1 * c2 + value.c2 * c1).mul_by_nonresidue() + value.c0 * c0;
+    let inverse = determinant.invert_vartime()?;
+    Some(Fp6 {
+        c0: inverse * c0,
+        c1: inverse * c1,
+        c2: inverse * c2,
+    })
+}
+
+fn invert_fp12_vartime(value: Fp12) -> Option<Fp12> {
+    let determinant = value.c0.square() - value.c1.square().mul_by_nonresidue();
+    let inverse = invert_fp6_vartime(determinant)?;
+    Some(Fp12 {
+        c0: value.c0 * inverse,
+        c1: value.c1 * -inverse,
+    })
+}
+
+fn decompress_pair(a: CompressedCyclotomic, b: CompressedCyclotomic) -> Option<(Fp12, Fp12)> {
+    fn numerator(f: CompressedCyclotomic) -> Fp2 {
+        let g1_sq = f.g1.square();
+        f.g5.square().mul_by_nonresidue() + g1_sq + g1_sq + g1_sq - f.g2 - f.g2
+    }
+    fn finish(f: CompressedCyclotomic, g4: Fp2) -> Fp12 {
+        let g0 =
+            (g4.square() + g4.square() + f.g3 * f.g5 - f.g2 * f.g1 - f.g2 * f.g1 - f.g2 * f.g1)
+                .mul_by_nonresidue()
+                + Fp2::one();
+        Fp12 {
+            c0: Fp6 {
+                c0: g0,
+                c1: f.g1,
+                c2: f.g2,
+            },
+            c1: Fp6 {
+                c0: f.g3,
+                c1: g4,
+                c2: f.g5,
+            },
+        }
+    }
+
+    let den_a = a.g3 + a.g3 + a.g3 + a.g3;
+    let den_b = b.g3 + b.g3 + b.g3 + b.g3;
+    // Batch two Fp2 inversions into one Fp inversion. A zero denominator
+    // makes the caller use the full cyclotomic exponentiation instead.
+    let inverse = (den_a * den_b).invert_vartime()?;
+    let g4_a = numerator(a) * (den_b * inverse);
+    let g4_b = numerator(b) * (den_a * inverse);
+    Some((finish(a, g4_a), finish(b, g4_b)))
+}
+
+fn cyclotomic_exp_full(f: Fp12) -> Fp12 {
+    let x = BLS_X;
+    let mut tmp = Fp12::one();
+    let mut found_one = false;
+    for i in (0..64).rev().map(|b| ((x >> b) & 1) == 1) {
+        if found_one {
+            tmp = cyclotomic_square(tmp)
+        } else {
+            found_one = i;
+        }
+
+        if i {
+            tmp *= f;
+        }
+    }
+
+    tmp.conjugate()
+}
+
+fn cyclotomic_exp(f: Fp12) -> Fp12 {
+    let mut power = CompressedCyclotomic::from(f);
+    for _ in 0..COMPRESSED_FIRST_SQUARES {
+        power = compressed_square(power);
+    }
+    let power_first = power;
+    for _ in 0..COMPRESSED_NEXT_SQUARES {
+        power = compressed_square(power);
+    }
+    let (power_first, mut power_next) = match decompress_pair(power_first, power) {
+        Some(pair) => pair,
+        None => return cyclotomic_exp_full(f),
+    };
+    let mut result = power_first * power_next;
+    for squarings in CYCLOTOMIC_TAIL_SQUARES {
+        for _ in 0..squarings {
+            power_next = cyclotomic_square(power_next);
+        }
+        result *= power_next;
+    }
+    cyclotomic_square(result.conjugate())
 }
 
 impl MillerLoopResult {
@@ -171,6 +412,56 @@ impl MillerLoopResult {
         f *= t4;
 
         Gt(f)
+    }
+}
+
+impl MillerLoopResult {
+    /// Converts the result of a Miller loop into an element of [`Gt`], using
+    /// efficient squaring in the cyclotomic subgroup of the degree-12 field
+    /// extension.
+    ///
+    /// This operation is variable time. Its inversions and compressed-square
+    /// fallback depend on the Miller loop result. Do not use it with long-lived
+    /// secret pairing inputs. Batch verification also includes fresh verifier
+    /// randomizers in this result.
+    pub fn final_exponentiation_vartime(&self) -> Gt {
+        let mut f = self.0;
+        // The p^6 Frobenius map conjugates the quadratic Fp12 extension.
+        let mut t0 = f.conjugate();
+        Gt(invert_fp12_vartime(f)
+            .map(|mut t1| {
+                let mut t2 = t0 * t1;
+                t1 = t2;
+                t2 = frobenius_map_2(t2);
+                t2 *= t1;
+                t1 = cyclotomic_square(t2).conjugate();
+                let mut t3 = cyclotomic_exp(t2);
+                let mut t4 = cyclotomic_square(t3);
+                let mut t5 = t1 * t3;
+                t1 = cyclotomic_exp(t5);
+                t0 = cyclotomic_exp(t1);
+                let mut t6 = cyclotomic_exp(t0);
+                t6 *= t4;
+                t4 = cyclotomic_exp(t6);
+                t5 = t5.conjugate();
+                t4 *= t5 * t2;
+                t5 = t2.conjugate();
+                t1 *= t2;
+                t1 = frobenius_map_2(t1.frobenius_map());
+                t6 *= t5;
+                t6 = t6.frobenius_map();
+                t3 *= t0;
+                t3 = frobenius_map_2(t3);
+                t3 *= t1;
+                t3 *= t6;
+                f = t3 * t4;
+
+                f
+            })
+            // We unwrap() because `MillerLoopResult` can only be constructed
+            // by a function within this crate, and we uphold the invariant
+            // that the enclosed value is nonzero.
+            .unwrap())
     }
 }
 
@@ -809,6 +1100,10 @@ impl pairing::MillerLoopResult for MillerLoopResult {
     fn final_exponentiation(&self) -> Self::Gt {
         self.final_exponentiation()
     }
+
+    fn final_exponentiation_vartime(&self) -> Self::Gt {
+        self.final_exponentiation_vartime()
+    }
 }
 
 #[cfg(feature = "alloc")]
@@ -966,3 +1261,219 @@ fn tricking_miller_loop_result() {
         Gt::identity()
     );
 }
+
+#[test]
+fn test_frobenius_map_2_matches_two_maps() {
+    use rand_core::SeedableRng;
+
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x2f; 16]);
+    for _ in 0..32 {
+        let value = Fp12::try_random(&mut rng).unwrap();
+        assert_eq!(
+            frobenius_map_2(value),
+            value.frobenius_map().frobenius_map()
+        );
+    }
+}
+
+#[test]
+fn test_compressed_cyclotomic_squaring() {
+    use rand_core::SeedableRng;
+
+    let last_checkpoint = COMPRESSED_FIRST_SQUARES + COMPRESSED_NEXT_SQUARES;
+    let mut bit = last_checkpoint;
+    let mut exponent = (1_u64 << COMPRESSED_FIRST_SQUARES) | (1_u64 << bit);
+    for squarings in CYCLOTOMIC_TAIL_SQUARES {
+        bit += squarings;
+        exponent |= 1_u64 << bit;
+    }
+    assert_eq!(BLS_X, exponent << 1);
+    assert!(BLS_X_IS_NEGATIVE);
+
+    let generator = Gt::generator().0;
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x35; 16]);
+    let sample = Fp12::try_random(&mut rng).unwrap();
+    let unitary = sample.conjugate() * sample.invert().unwrap();
+    let cyclotomic = unitary.frobenius_map().frobenius_map() * unitary;
+    for (index, base) in [generator, generator.square(), Fp12::one(), cyclotomic]
+        .into_iter()
+        .enumerate()
+    {
+        let mut full = base;
+        let mut ordinary = base;
+        let mut compressed = CompressedCyclotomic::from(base);
+        let mut checkpoint_first = None;
+        let mut checkpoint_next = None;
+
+        for exponent in 1..=last_checkpoint {
+            full = cyclotomic_square(full);
+            ordinary = ordinary.square();
+            compressed = compressed_square(compressed);
+            assert_eq!(full, ordinary);
+            assert_eq!(compressed.g1, full.c0.c1);
+            assert_eq!(compressed.g2, full.c0.c2);
+            assert_eq!(compressed.g3, full.c1.c0);
+            assert_eq!(compressed.g5, full.c1.c2);
+
+            if exponent == COMPRESSED_FIRST_SQUARES {
+                checkpoint_first = Some((compressed, full));
+            } else if exponent == last_checkpoint {
+                checkpoint_next = Some((compressed, full));
+            }
+        }
+
+        let (compressed_first, full_first) = checkpoint_first.unwrap();
+        let (compressed_next, full_next) = checkpoint_next.unwrap();
+        if index != 2 {
+            assert_eq!(
+                decompress_pair(compressed_first, compressed_next),
+                Some((full_first, full_next))
+            );
+        } else {
+            assert_eq!(decompress_pair(compressed_first, compressed_next), None);
+        }
+        assert_eq!(cyclotomic_exp(base), cyclotomic_exp_full(base));
+    }
+}
+
+#[test]
+fn test_vartime_fp12_inversion() {
+    use rand_core::SeedableRng;
+
+    assert_eq!(invert_fp12_vartime(Fp12::zero()), None);
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x52; 16]);
+    for _ in 0..32 {
+        let value = Fp12::try_random(&mut rng).unwrap();
+        let inverse = invert_fp12_vartime(value).unwrap();
+        assert_eq!(inverse, value.invert().unwrap());
+        assert_eq!(value * inverse, Fp12::one());
+    }
+}
+
+#[test]
+fn test_vartime_final_exponentiation_matches_original() {
+    use rand_core::SeedableRng;
+
+    fn check(value: Fp12) {
+        let result = MillerLoopResult(value);
+        assert_eq!(
+            result.final_exponentiation_vartime(),
+            result.final_exponentiation()
+        );
+        assert_eq!(
+            <MillerLoopResult as pairing::MillerLoopResult>::final_exponentiation_vartime(&result),
+            result.final_exponentiation(),
+        );
+    }
+
+    // Identity, proper subfields, and nontrivial tower basis elements.
+    for value in [
+        Fp12::one(),
+        -Fp12::one(),
+        Fp12::from(Fp2 {
+            c0: Fp::one(),
+            c1: Fp::one(),
+        }),
+        Fp12 {
+            c0: Fp6::zero(),
+            c1: Fp6::one(),
+        },
+        Fp12::from(Fp6 {
+            c0: Fp2::zero(),
+            c1: Fp2::one(),
+            c2: Fp2::zero(),
+        }),
+        Gt::generator().0,
+    ] {
+        check(value);
+    }
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x65; 16]);
+    for _ in 0..64 {
+        let value = Fp12::try_random(&mut rng).unwrap();
+        if !bool::from(value.is_zero()) {
+            check(value);
+        }
+    }
+}
+
+#[test]
+fn test_vartime_tower_inversion_and_frobenius_boundaries() {
+    use rand_core::SeedableRng;
+
+    assert_eq!(invert_fp6_vartime(Fp6::zero()), None);
+    assert_eq!(invert_fp12_vartime(Fp12::zero()), None);
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x66; 16]);
+    for _ in 0..128 {
+        let value = Fp6::try_random(&mut rng).unwrap();
+        assert_eq!(
+            invert_fp6_vartime(value),
+            Option::<Fp6>::from(value.invert())
+        );
+        let value = Fp12::try_random(&mut rng).unwrap();
+        assert_eq!(
+            invert_fp12_vartime(value),
+            Option::<Fp12>::from(value.invert())
+        );
+        assert_eq!(
+            frobenius_map_2(value),
+            value.frobenius_map().frobenius_map()
+        );
+        let mut sixth = value;
+        for _ in 0..6 {
+            sixth = sixth.frobenius_map();
+        }
+        assert_eq!(value.conjugate(), sixth);
+    }
+    for value in [Fp12::zero(), Fp12::one(), -Fp12::one()] {
+        assert_eq!(
+            frobenius_map_2(value),
+            value.frobenius_map().frobenius_map()
+        );
+        assert_eq!(
+            invert_fp12_vartime(value),
+            Option::<Fp12>::from(value.invert())
+        );
+    }
+}
+
+#[test]
+fn test_random_compressed_checkpoints_and_exception_fallback() {
+    use rand_core::SeedableRng;
+
+    let identity = CompressedCyclotomic::from(Fp12::one());
+    let generator = CompressedCyclotomic::from(Gt::generator().0);
+    // Either checkpoint can independently trigger the zero-denominator fallback.
+    assert_eq!(decompress_pair(identity, generator), None);
+    assert_eq!(decompress_pair(generator, identity), None);
+    assert_eq!(
+        cyclotomic_exp(Fp12::one()),
+        cyclotomic_exp_full(Fp12::one())
+    );
+
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x67; 16]);
+    for _ in 0..64 {
+        let sample = Fp12::try_random(&mut rng).unwrap();
+        let unitary = sample.conjugate() * sample.invert().unwrap();
+        let base = unitary.frobenius_map().frobenius_map() * unitary;
+        let mut full = base;
+        let mut compressed = CompressedCyclotomic::from(base);
+        let mut first = None;
+        for i in 1..=COMPRESSED_FIRST_SQUARES + COMPRESSED_NEXT_SQUARES {
+            full = full.square();
+            compressed = compressed_square(compressed);
+            assert_eq!(compressed.g1, full.c0.c1);
+            assert_eq!(compressed.g2, full.c0.c2);
+            assert_eq!(compressed.g3, full.c1.c0);
+            assert_eq!(compressed.g5, full.c1.c2);
+            if i == COMPRESSED_FIRST_SQUARES {
+                first = Some((compressed, full));
+            }
+        }
+        let (compressed_first, full_first) = first.unwrap();
+        if let Some(pair) = decompress_pair(compressed_first, compressed) {
+            assert_eq!(pair, (full_first, full));
+        }
+        assert_eq!(cyclotomic_exp(base), cyclotomic_exp_full(base));
+    }
+}
+

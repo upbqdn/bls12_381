@@ -318,6 +318,17 @@ impl Fp2 {
         })
     }
 
+    /// Inverts using the variable-time base-field inverse. Timing depends on
+    /// this element's representation.
+    #[cfg(feature = "pairings")]
+    pub(crate) fn invert_vartime(&self) -> Option<Self> {
+        let inverse = (self.c0.square() + self.c1.square()).invert_vartime()?;
+        Some(Self {
+            c0: self.c0 * inverse,
+            c1: -(self.c1 * inverse),
+        })
+    }
+
     /// Although this is labeled "vartime", it is only
     /// variable time with respect to the exponent. It
     /// is also not exposed in the public API.
@@ -894,4 +905,29 @@ fn test_zeroize() {
     let mut a = Fp2::one();
     a.zeroize();
     assert!(bool::from(a.is_zero()));
+}
+
+#[cfg(feature = "pairings")]
+#[test]
+fn test_vartime_inversion_matches_constant_time() {
+    use rand_core::SeedableRng;
+
+    let mut rng = rand_xorshift::XorShiftRng::from_seed([0x63; 16]);
+    for value in [
+        Fp2::zero(),
+        Fp2::one(),
+        -Fp2::one(),
+        Fp2 {
+            c0: Fp::zero(),
+            c1: Fp::one(),
+        },
+    ] {
+        assert_eq!(value.invert_vartime(), Option::<Fp2>::from(value.invert()));
+    }
+    for _ in 0..256 {
+        let value = Fp2::try_random(&mut rng).unwrap();
+        let inverse = value.invert_vartime().unwrap();
+        assert_eq!(inverse, value.invert().unwrap());
+        assert_eq!(value * inverse, Fp2::one());
+    }
 }
