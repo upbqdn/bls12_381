@@ -1,9 +1,9 @@
 use crate::fp::Fp;
-use crate::fp12::Fp12;
 use crate::fp2::Fp2;
 use crate::fp6::Fp6;
+use crate::fp12::Fp12;
 use crate::g1::BETA;
-use crate::{G1Affine, G1Projective, G2Affine, G2Projective, Scalar, BLS_X, BLS_X_IS_NEGATIVE};
+use crate::{BLS_X, BLS_X_IS_NEGATIVE, G1Affine, G1Projective, G2Affine, G2Projective, Scalar};
 
 use core::borrow::Borrow;
 use core::fmt;
@@ -1362,10 +1362,12 @@ fn test_reusable_g2_preparation() {
     let raw = G2Prepared::from(q);
     let normalized = Bls12::prepare_reusable_g2(q);
 
-    assert!(normalized
-        .coeffs
-        .iter()
-        .all(|(_, _, c0)| bool::from(c0.is_zero()) || *c0 == Fp2::one()));
+    assert!(
+        normalized
+            .coeffs
+            .iter()
+            .all(|(_, _, c0)| bool::from(c0.is_zero()) || *c0 == Fp2::one())
+    );
     assert_eq!(
         multi_miller_loop(&[(&p, &raw)]).final_exponentiation(),
         multi_miller_loop(&[(&p, &normalized)]).final_exponentiation(),
