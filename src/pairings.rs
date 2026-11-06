@@ -1437,7 +1437,7 @@ fn test_compressed_cyclotomic_squaring() {
         exponent |= 1_u64 << bit;
     }
     assert_eq!(BLS_X, exponent << 1);
-    assert!(BLS_X_IS_NEGATIVE);
+    const _: () = assert!(BLS_X_IS_NEGATIVE);
 
     let generator = Gt::generator().0;
     let mut rng = rand_xorshift::XorShiftRng::from_seed([0x35; 16]);
